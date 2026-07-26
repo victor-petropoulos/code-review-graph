@@ -15,6 +15,7 @@ import jsonschema
 
 # Upstream imports
 from code_review_graph.tools.review import get_review_context
+from code_review_graph.tools.context import get_minimal_context
 
 
 # =============================================================================
@@ -108,6 +109,57 @@ STATE = {
     "watcher_task": None,
     "watcher_running": False,
 }
+
+
+# =============================================================================
+# BACKGROUND WATCHER (asyncio polling - no watchdog dependency)
+# =============================================================================
+
+async def _watcher_loop(repo_root: str = ".", debounce: float = 2.0) -> None:
+    """Background task: polls for file changes, triggers review on save."""
+    last_mtimes: dict[str, float] = {}
+    code_exts = tuple(LANG_MAP.keys())
+
+    while STATE["watcher_running"]:
+        try:
+            repo = Path(repo_root)
+            for file_path in repo.rglob("*"):
+                if file_path.suffix.lower() in code_exts and file_path.is_file():
+                    try:
+                        mtime = file_path.stat().st_mtime
+                        key = str(file_path)
+                        if key not in last_mtimes:
+                            last_mtimes[key] = mtime
+                        elif mtime > last_mtimes[key]:
+                            # File changed - debounce
+                            await asyncio.sleep(debounce)
+                            # Re-check after debounce
+                            if file_path.stat().st_mtime == mtime:
+                                print(f"[crg-review] File changed: {file_path.relative_to(repo)}", file=sys.stderr)
+                                await review_file(str(file_path.relative_to(repo)), repo_root)
+                            last_mtimes[key] = file_path.stat().st_mtime
+                    except (OSError, PermissionError):
+                        pass
+        except Exception as e:
+            print(f"[crg-review] Watcher error: {e}", file=sys.stderr)
+
+        await asyncio.sleep(1.0)  # Poll interval
+
+
+def start_watcher(repo_root: str = ".", debounce: float = 2.0) -> None:
+    """Start the background file watcher."""
+    if STATE["watcher_running"]:
+        return
+    STATE["watcher_running"] = True
+    STATE["watcher_task"] = asyncio.create_task(_watcher_loop(repo_root, debounce))
+
+
+def stop_watcher() -> None:
+    """Stop the background file watcher."""
+    if STATE["watcher_task"]:
+        STATE["watcher_task"].cancel()
+        STATE["watcher_task"] = None
+    STATE["watcher_running"] = False
 
 
 # =============================================================================
@@ -230,6 +282,18 @@ async def review_changes(
     if not changed_files:
         return {"summary": "No changed files", "issues": [], "positive": [], "tokens_used": 0}
 
+    # Enrich with signatures of impacted files (quality bias - full context)
+    max_impacted = int(os.getenv("CRG_REVIEW_MAX_IMPACTED_FILES", "10"))
+    impacted_files = ctx.get("impacted_files", [])[:max_impacted]
+    signatures = {}
+    for f in impacted_files:
+        sig_result = get_minimal_context(repo_root=repo_root, base=base, changed_files=[f])
+        if sig_result.get("status") == "ok":
+            # get_minimal_context returns signatures in key_entities
+            sigs = sig_result.get("key_entities", [])
+            if sigs:
+                signatures[f] = sigs
+
     # MVP: One LLM call per changed file (no blast-radius clustering yet)
     all_issues, all_positive, total_tokens = [], [], 0
 
@@ -239,11 +303,19 @@ async def review_changes(
             continue
         language = detect_language(file_path)
 
-        # Build prompt with graph context for this file
-        impacted_files = ctx.get("impacted_files", [])
-        edges = ctx.get("graph", {}).get("edges", [])
+        # Build prompt with graph context + signatures for this file
         impacted_count = 1 if file_path in impacted_files else 0
+        edges = ctx.get("graph", {}).get("edges", [])
         caller_count = len([e for e in edges if e.get("source") == file_path or e.get("target") == file_path])
+
+        # Add signature context
+        sig_context = ""
+        if signatures:
+            sig_context = "\n**Impacted File Signatures (from blast radius):**\n"
+            for sig_file, sigs in signatures.items():
+                sig_context += f"\n--- {sig_file} ---\n"
+                for s in sigs[:5]:
+                    sig_context += f"  {s}\n"
 
         prompt = f"""## Code Review Request
 
@@ -255,6 +327,7 @@ async def review_changes(
 **Blast Radius (from code graph)**:
 - {impacted_count} impacted files in this call
 - {caller_count} call/dependency edges analyzed
+{sig_context}
 
 **Diff**:
 ```diff
@@ -436,60 +509,6 @@ Return JSON only per the output format.
     }
     STATE["latest_review"] = result
     return result
-
-
-# =============================================================================
-# BACKGROUND WATCHER (asyncio polling, no watchdog dep)
-# =============================================================================
-
-async def _watcher_loop(repo_root: str = ".", debounce_seconds: float = 2.0) -> None:
-    """Poll filesystem for changes, trigger review on modified code files."""
-    last_review_time = 0.0
-    last_mtimes: dict[str, float] = {}
-
-    code_extensions = set(LANG_MAP.keys())
-
-    while STATE["watcher_running"]:
-        try:
-            current_time = asyncio.get_event_loop().time()
-            changed = False
-
-            # Scan repo for code files
-            for ext in code_extensions:
-                for file_path in Path(repo_root).rglob(f"*{ext}"):
-                    if file_path.is_file():
-                        try:
-                            mtime = file_path.stat().st_mtime
-                            if str(file_path) not in last_mtimes or mtime > last_mtimes[str(file_path)]:
-                                last_mtimes[str(file_path)] = mtime
-                                if current_time - last_review_time >= debounce_seconds:
-                                    changed = True
-                        except OSError:
-                            pass
-
-            if changed:
-                # Trigger review on all changed files
-                await review_changes(repo_root=repo_root)
-                last_review_time = current_time
-
-        except Exception as e:
-            print(f"[crg-review watcher] Error: {e}", file=sys.stderr)
-
-        await asyncio.sleep(1.0)
-
-
-def start_watcher(repo_root: str = ".") -> None:
-    """Start the background watcher task."""
-    if not STATE["watcher_running"]:
-        STATE["watcher_running"] = True
-        STATE["watcher_task"] = asyncio.create_task(_watcher_loop(repo_root))
-
-
-def stop_watcher() -> None:
-    """Stop the background watcher task."""
-    STATE["watcher_running"] = False
-    if STATE["watcher_task"]:
-        STATE["watcher_task"].cancel()
 
 
 # =============================================================================
