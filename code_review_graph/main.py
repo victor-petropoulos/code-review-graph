@@ -60,6 +60,7 @@ from .tools import (
     traverse_graph_func,
     with_provenance,
 )
+from crg_review import register_review_tools
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,9 @@ mcp = FastMCP(
         "builds a structural graph, and provides smart impact analysis."
     ),
 )
+
+# Register LLM review tools
+register_review_tools(mcp)
 
 
 @mcp.tool()
