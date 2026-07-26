@@ -15,7 +15,6 @@ import jsonschema
 
 # Upstream imports
 from code_review_graph.tools.review import get_review_context
-from code_review_graph.tools.context import get_minimal_context
 
 
 # =============================================================================
@@ -116,30 +115,27 @@ STATE = {
 # =============================================================================
 
 async def _watcher_loop(repo_root: str = ".", debounce: float = 2.0) -> None:
-    """Background task: polls for file changes, triggers review on save."""
-    last_mtimes: dict[str, float] = {}
-    code_exts = tuple(LANG_MAP.keys())
-
+    """Background task: polls git for changed files, triggers review on save."""
+    last_hash = ""
     while STATE["watcher_running"]:
         try:
-            repo = Path(repo_root)
-            for file_path in repo.rglob("*"):
-                if file_path.suffix.lower() in code_exts and file_path.is_file():
-                    try:
-                        mtime = file_path.stat().st_mtime
-                        key = str(file_path)
-                        if key not in last_mtimes:
-                            last_mtimes[key] = mtime
-                        elif mtime > last_mtimes[key]:
-                            # File changed - debounce
-                            await asyncio.sleep(debounce)
-                            # Re-check after debounce
-                            if file_path.stat().st_mtime == mtime:
-                                print(f"[crg-review] File changed: {file_path.relative_to(repo)}", file=sys.stderr)
-                                await review_file(str(file_path.relative_to(repo)), repo_root)
-                            last_mtimes[key] = file_path.stat().st_mtime
-                    except (OSError, PermissionError):
-                        pass
+            r = subprocess.run(
+                ["git", "-C", repo_root, "diff", "--name-only", "HEAD"],
+                capture_output=True, text=True,
+            )
+            changes = r.stdout.strip().splitlines() if r.stdout.strip() else []
+            current_hash = "\n".join(changes)
+            if changes and current_hash != last_hash:
+                await asyncio.sleep(debounce)
+                # Re-check after debounce — only review if changes still present
+                r2 = subprocess.run(
+                    ["git", "-C", repo_root, "diff", "--name-only", "HEAD"],
+                    capture_output=True, text=True,
+                )
+                if r2.stdout.strip():
+                    print(f"[crg-review] {len(changes)} file(s) changed", file=sys.stderr)
+                    await review_changes(repo_root=repo_root)
+                last_hash = current_hash
         except Exception as e:
             print(f"[crg-review] Watcher error: {e}", file=sys.stderr)
 
@@ -282,17 +278,20 @@ async def review_changes(
     if not changed_files:
         return {"summary": "No changed files", "issues": [], "positive": [], "tokens_used": 0}
 
-    # Enrich with signatures of impacted files (quality bias - full context)
+    # Enrich with signatures of impacted files (from graph nodes, no extra calls)
     max_impacted = int(os.getenv("CRG_REVIEW_MAX_IMPACTED_FILES", "10"))
     impacted_files = ctx.get("impacted_files", [])[:max_impacted]
-    signatures = {}
-    for f in impacted_files:
-        sig_result = get_minimal_context(repo_root=repo_root, base=base, changed_files=[f])
-        if sig_result.get("status") == "ok":
-            # get_minimal_context returns signatures in key_entities
-            sigs = sig_result.get("key_entities", [])
-            if sigs:
-                signatures[f] = sigs
+    impacted_nodes = ctx.get("graph", {}).get("impacted_nodes", [])
+    edges = ctx.get("graph", {}).get("edges", [])
+
+    # Group signatures by file from impacted_nodes (free from get_review_context)
+    signatures: dict[str, list[str]] = {}
+    for node in impacted_nodes:
+        fp = node.get("file_path", "")
+        if fp and fp in impacted_files:
+            signatures.setdefault(fp, []).append(
+                f"{node.get('kind', '')} {node.get('qualified_name', node.get('name', ''))} (L{node.get('line_start', '?')}-{node.get('line_end', '?')})"
+            )
 
     # MVP: One LLM call per changed file (no blast-radius clustering yet)
     all_issues, all_positive, total_tokens = [], [], 0
@@ -305,10 +304,9 @@ async def review_changes(
 
         # Build prompt with graph context + signatures for this file
         impacted_count = 1 if file_path in impacted_files else 0
-        edges = ctx.get("graph", {}).get("edges", [])
         caller_count = len([e for e in edges if e.get("source") == file_path or e.get("target") == file_path])
 
-        # Add signature context
+        # Add signature context from impacted nodes (already gathered above)
         sig_context = ""
         if signatures:
             sig_context = "\n**Impacted File Signatures (from blast radius):**\n"
@@ -481,7 +479,7 @@ async def review_pr(
 
 **Diff**:
 ```diff
-{diff[:8000]}
+{_truncate_at_hunk_boundary(diff, 8000)}
 ```
 
 Review thoroughly. Focus on:
