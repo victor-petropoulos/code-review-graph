@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -344,6 +344,8 @@ version = "2.3.7"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "httpx" },
+    { name = "jsonschema" },
     { name = "mcp" },
     { name = "networkx", version = "3.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "networkx", version = "3.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -409,8 +411,10 @@ requires-dist = [
     { name = "code-review-graph", extras = ["wiki"], marker = "extra == 'all'" },
     { name = "fastmcp", specifier = ">=3.2.4,<4" },
     { name = "google-generativeai", marker = "extra == 'google-embeddings'", specifier = ">=0.8.0,<1" },
+    { name = "httpx", specifier = ">=0.27.0,<1" },
     { name = "igraph", marker = "extra == 'communities'", specifier = ">=0.11.0" },
     { name = "jedi", marker = "extra == 'enrichment'", specifier = ">=0.19.2" },
+    { name = "jsonschema", specifier = ">=4.20.0,<5" },
     { name = "matplotlib", marker = "extra == 'eval'", specifier = ">=3.7.0" },
     { name = "mcp", specifier = ">=1.0.0,<2" },
     { name = "networkx", specifier = ">=3.2,<4" },
