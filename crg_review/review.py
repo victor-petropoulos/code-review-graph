@@ -98,7 +98,7 @@ LANG_MAP = {
     ".go": "go", ".java": "java", ".cpp": "cpp", ".c": "c",
     ".cs": "csharp", ".rb": "ruby", ".php": "php", ".swift": "swift",
     ".kt": "kotlin", ".scala": "scala", ".sql": "sql",
-    ".mjs": "javascript", ".cjs": "javascript",
+    ".mjs": "javascript", ".cjs": "javascript", ".mts": "typescript", ".cts": "typescript",
     ".vue": "vue", ".svelte": "svelte", ".astro": "astro",
 }
 
@@ -117,20 +117,25 @@ STATE = {
 async def _watcher_loop(repo_root: str = ".", debounce: float = 2.0) -> None:
     """Background task: polls git for changed files, triggers review on save."""
     last_hash = ""
+    loop = asyncio.get_event_loop()
     while STATE["watcher_running"]:
         try:
-            r = subprocess.run(
-                ["git", "-C", repo_root, "diff", "--name-only", "HEAD"],
-                capture_output=True, text=True,
+            r = await loop.run_in_executor(
+                None, lambda: subprocess.run(
+                    ["git", "-C", repo_root, "diff", "--name-only", "HEAD"],
+                    capture_output=True, text=True,
+                )
             )
             changes = r.stdout.strip().splitlines() if r.stdout.strip() else []
             current_hash = "\n".join(changes)
             if changes and current_hash != last_hash:
                 await asyncio.sleep(debounce)
                 # Re-check after debounce — only review if changes still present
-                r2 = subprocess.run(
-                    ["git", "-C", repo_root, "diff", "--name-only", "HEAD"],
-                    capture_output=True, text=True,
+                r2 = await loop.run_in_executor(
+                    None, lambda: subprocess.run(
+                        ["git", "-C", repo_root, "diff", "--name-only", "HEAD"],
+                        capture_output=True, text=True,
+                    )
                 )
                 if r2.stdout.strip():
                     print(f"[crg-review] {len(changes)} file(s) changed", file=sys.stderr)
@@ -344,7 +349,8 @@ Return JSON only per the output format.
 """
         parsed = await _call_llm_parsed(prompt, endpoint_url, model, api_key, base_prompt=prompt)
         if parsed is None or "error" in parsed:
-            return {"summary": parsed.get("error", "LLM call failed") if parsed else "LLM call failed", "issues": [], "positive": [], "tokens_used": 0, **(parsed or {})}
+            print(f"[crg-review] review_changes: skipped {file_path}: {parsed.get('error', 'unknown') if parsed else 'parse failure'}", file=sys.stderr)
+            continue
         llm_response = parsed["response"]
         content = parsed["content"]
         tokens = llm_response.get("usage", {}).get("total_tokens", 0)
@@ -402,7 +408,9 @@ Review thoroughly. Return JSON only per the output format.
 """
     parsed = await _call_llm_parsed(prompt, endpoint_url, model, api_key, base_prompt=prompt)
     if parsed is None or "error" in parsed:
-        return {"summary": parsed.get("error", "LLM call failed") if parsed else "LLM call failed", "issues": [], "positive": [], "tokens_used": 0, **(parsed or {})}
+        print(f"[crg-review] review_file: skipped {file_path}: {parsed.get('error', 'unknown') if parsed else 'parse failure'}", file=sys.stderr)
+        STATE["latest_review"] = {"summary": f"Review failed for {file_path}", "issues": [], "positive": [], "tokens_used": 0}
+        return STATE["latest_review"]
     llm_response = parsed["response"]
     content = parsed["content"]
     tokens = llm_response.get("usage", {}).get("total_tokens", 0)
@@ -494,7 +502,9 @@ Return JSON only per the output format.
 """
     parsed = await _call_llm_parsed(prompt, endpoint_url, model, api_key, base_prompt=prompt)
     if parsed is None or "error" in parsed:
-        return {"summary": parsed.get("error", "LLM call failed") if parsed else "LLM call failed", "issues": [], "positive": [], "tokens_used": 0, **(parsed or {})}
+        print(f"[crg-review] review_pr: LLM call failed: {parsed.get('error', 'unknown') if parsed else 'parse failure'}", file=sys.stderr)
+        STATE["latest_review"] = {"summary": f"Review failed for PR #{pr_number}", "issues": [], "positive": [], "tokens_used": 0}
+        return STATE["latest_review"]
     llm_response = parsed["response"]
     content = parsed["content"]
     tokens = llm_response.get("usage", {}).get("total_tokens", 0)
