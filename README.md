@@ -604,7 +604,70 @@ all tools are available. This is especially useful for MCP client configurations
 }
 ```
 
-</details>
+### LLM Review Layer (Pair Programming Assistant)
+
+The `crg_review` package adds a local-LLM-powered "second pair of eyes" that watches your files and reviews changes automatically on save. It leverages the graph's blast-radius analysis to provide contextual, graph-aware code reviews.
+
+**Requirements:** Local OpenAI-compatible inference endpoint (MTPLX, Ollama, LM Studio, vLLM, LocalAI, etc.)
+
+**Environment Variables:**
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CRG_REVIEW_ENDPOINT_URL` | OpenAI-compatible chat endpoint | `http://localhost:8000/v1` |
+| `CRG_REVIEW_MODEL` | Model name for reviews | `mtplx-qwen36-35b-a3b-optimized-balance` |
+| `CRG_REVIEW_API_KEY` | API key (if required by endpoint) | *(empty)* |
+| `CRG_REVIEW_MAX_IMPACTED_FILES` | Max impacted files to include signatures for | `10` |
+
+**MCP Tools Added:**
+
+| Tool | Description |
+|------|-------------|
+| `review_changes` | Review local git changes vs `HEAD~1` (or custom base) |
+| `review_file` | Review a single file |
+| `review_pr` | Review a GitHub PR via `gh` CLI |
+| `get_reviewer_feedback` | Pull latest findings from background watcher |
+
+**MCP Resource:**
+
+| Resource URI | Description |
+|--------------|-------------|
+| `review://latest` | Latest review findings as JSON |
+
+**Auto-Nudge System Prompt:**
+
+The package exposes `PAIR_REVIEWER_SYSTEM_ADDITION` — a system prompt fragment that tells the main coding LLM to proactively check `get_reviewer_feedback()` before declaring tasks done. Inject it into your AI assistant's system prompt (Cursor: `.cursorrules`, Claude Code: `CLAUDE.md`, OpenCode: `~/.config/opencode/agent.md`):
+
+```markdown
+## 🧠 You have a background pair reviewer running.
+
+### When to check feedback:
+- Before declaring any non-trivial task "done"
+- After writing new functions, classes, or complex logic
+- When you suspect edge cases or security issues
+
+### How to check:
+Call `get_reviewer_feedback()` — returns latest structured findings (line, severity, category, message, suggestion).
+
+### On issues found:
+- Fix directly if suggestion is clear
+- Ask clarifying question if ambiguous
+- Don't ignore CRITICAL/WARNING — real bugs
+```
+
+**Background Watcher:**
+
+Start the background watcher from your code (or MCP tool) to trigger reviews automatically on file save:
+
+```python
+from crg_review import start_watcher, stop_watcher
+
+start_watcher("/path/to/repo", debounce=2.0)
+# ... later ...
+stop_watcher()
+```
+
+The watcher uses `asyncio` + `pathlib` polling (no `watchdog` dependency). It reviews changed files, enriches prompts with impacted file signatures from the graph, and stores results in `STATE["latest_review"]` accessible via `get_reviewer_feedback()` and `review://latest`.
 
 ---
 
